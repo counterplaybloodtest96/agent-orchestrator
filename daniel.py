@@ -592,10 +592,17 @@ def _kb_search(query: str, cfg: dict, limit: int = 5) -> str:
     port = cfg.get("kb_port", "3838")
     url = f"http://localhost:{port}/api/v1/search?q={urllib.parse.quote(query)}&limit={limit}"
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        headers = {"Accept": "application/json"}
+        # Use API key if configured
+        kb_key = cfg.get("keys", {}).get("kb", "") or os.environ.get("KB_API_KEY", "")
+        if kb_key:
+            headers["X-API-Key"] = kb_key
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-            if not data:
+            raw = json.loads(resp.read())
+            # v1 API wraps results: {"results": [...]}
+            data = raw.get("results", raw) if isinstance(raw, dict) else raw
+            if not data or not isinstance(data, list):
                 return ""
             results = []
             for doc in data[:limit]:
