@@ -1,0 +1,1074 @@
+#!/usr/bin/env python3
+"""Daniel: local multi-agent terminal assistant with fallback chains."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from getpass import getpass
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+
+AGENTS = ("claude", "codex", "gemini")
+GEMINI_CLI_TIMEOUT_SECS = 120
+DEFAULTS = {
+    "tasks_root": "/home/shawn/tasks",
+    "claude_mode": "cli",
+    "codex_mode": "api",
+    "gemini_mode": "api",
+    "models": {
+        "claude": "claude-sonnet-4-5",
+        "codex": "gpt-5",
+        "codex_orchestrator": "gpt-5",
+        "gemini": "gemini-2.5-pro",
+    },
+    "chains": {
+        "orchestrator": ["claude", "codex", "gemini"],
+        "implementation": ["codex", "claude", "gemini"],
+        "uidocs": ["gemini", "codex", "claude"],
+        "review": ["claude", "codex", "gemini"],
+    },
+    "keys": {
+        "openai": "",
+        "anthropic": "",
+        "gemini": "",
+    },
+    "service_overrides": {
+        "claude": {"manual_disabled": False, "disabled_until": ""},
+        "codex": {"manual_disabled": False, "disabled_until": ""},
+        "gemini": {"manual_disabled": False, "disabled_until": ""},
+    },
+    "allowed_dirs": ["/home/shawn"],
+}
+
+CONFIG_DIR = Path.home() / ".config" / "daniel"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+
+
+def _read(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def _write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return json.loads(json.dumps(DEFAULTS))
+    raw = json.loads(_read(CONFIG_PATH))
+    cfg = json.loads(json.dumps(DEFAULTS))
+    for top in (
+        "tasks_root",
+        "claude_mode",
+        "codex_mode",
+        "gemini_mode",
+        "models",
+        "chains",
+        "keys",
+        "service_overrides",
+        "allowed_dirs",
+    ):
+        if top not in raw:
+            continue
+        if isinstance(cfg[top], dict):
+            cfg[top].update(raw[top])
+        else:
+            cfg[top] = raw[top]
+    for agent in AGENTS:
+        cfg["service_overrides"].setdefault(agent, {"manual_disabled": False, "disabled_until": ""})
+        ov = cfg["service_overrides"][agent]
+        if not isinstance(ov, dict):
+            cfg["service_overrides"][agent] = {"manual_disabled": False, "disabled_until": ""}
+            continue
+        ov.setdefault("manual_disabled", False)
+        ov.setdefault("disabled_until", "")
+    if not isinstance(cfg.get("allowed_dirs"), list):
+        cfg["allowed_dirs"] = ["/home/shawn"]
+    cfg["allowed_dirs"] = [str(Path(p).expanduser()) for p in cfg["allowed_dirs"] if str(p).strip()]
+    return cfg
+
+
+def _save_config(cfg: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    os.chmod(CONFIG_PATH, 0o600)
+
+
+def _try_save_config(cfg: dict) -> tuple[bool, str]:
+    try:
+        _save_config(cfg)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _parse_chain(raw: str, default: list[str]) -> list[str]:
+    raw = raw.strip()
+    if not raw:
+        return list(default)
+    out: list[str] = []
+    for part in raw.replace(" ", "").split(","):
+        if part in AGENTS and part not in out:
+            out.append(part)
+    return out or list(default)
+
+
+def _key_for(agent: str, cfg: dict) -> str:
+    mapping = {
+        "codex": cfg["keys"]["openai"] if cfg.get("codex_mode", "api") == "api" else "cli",
+        "claude": cfg["keys"]["anthropic"] if cfg.get("claude_mode", "cli") == "api" else "cli",
+        "gemini": cfg["keys"]["gemini"] if cfg.get("gemini_mode", "api") == "api" else "cli",
+    }
+    return mapping[agent].strip()
+
+
+def _available(agent: str, cfg: dict) -> bool:
+    if agent == "codex":
+        mode = cfg.get("codex_mode", "api")
+        if mode == "api":
+            return bool(cfg["keys"]["openai"].strip())
+        if mode == "cli":
+            return shutil.which("codex") is not None
+        return False
+    if agent == "claude":
+        mode = cfg.get("claude_mode", "cli")
+        if mode == "api":
+            return bool(cfg["keys"]["anthropic"].strip())
+        if mode == "cli":
+            return shutil.which("claude") is not None
+        return False
+    if agent == "gemini":
+        mode = cfg.get("gemini_mode", "api")
+        if mode == "api":
+            return bool(cfg["keys"]["gemini"].strip())
+        if mode == "cli":
+            return shutil.which("gemini") is not None
+        return False
+    return bool(_key_for(agent, cfg))
+
+
+def _parse_iso_utc(value: str) -> datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _format_iso_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _service_disabled_reason(agent: str, cfg: dict, now: datetime | None = None) -> str | None:
+    now = now or datetime.now(timezone.utc)
+    override = cfg.get("service_overrides", {}).get(agent, {})
+    if override.get("manual_disabled", False):
+        return "manually disabled"
+    until = _parse_iso_utc(str(override.get("disabled_until", "")))
+    if until is None:
+        return None
+    if now < until:
+        return f"disabled until { _format_iso_utc(until) }"
+    override["disabled_until"] = ""
+    return None
+
+
+def _service_status(agent: str, cfg: dict) -> str:
+    if not _available(agent, cfg):
+        return "unavailable (missing key/cli)"
+    reason = _service_disabled_reason(agent, cfg)
+    if reason:
+        return f"down ({reason})"
+    return "up"
+
+
+def _parse_claude_reset_utc(error_text: str) -> datetime | None:
+    m = re.search(r"resets\s+([A-Za-z]{3}\s+\d{1,2},\s+\d{1,2}(?::\d{2})?(?:am|pm)\s+\(UTC\))", error_text, re.IGNORECASE)
+    if not m:
+        return None
+    raw = m.group(1)
+    now = datetime.now(timezone.utc)
+    for fmt in ("%b %d, %I:%M%p (UTC)", "%b %d, %I%p (UTC)"):
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            candidate = parsed.replace(year=now.year, tzinfo=timezone.utc)
+            if candidate < now - timedelta(hours=1):
+                candidate = candidate.replace(year=now.year + 1)
+            return candidate
+        except ValueError:
+            continue
+    return None
+
+
+def _apply_auto_downtime(agent: str, error_text: str, cfg: dict) -> str | None:
+    text = (error_text or "").strip()
+    if not text:
+        return None
+    override = cfg["service_overrides"][agent]
+
+    if agent == "claude" and "out of extra usage" in text.lower():
+        reset_at = _parse_claude_reset_utc(text)
+        if reset_at is not None:
+            override["manual_disabled"] = False
+            override["disabled_until"] = _format_iso_utc(reset_at)
+            ok, err = _try_save_config(cfg)
+            suffix = "" if ok else f" (warning: could not persist config: {err})"
+            return f"auto-down: {agent} until {override['disabled_until']}{suffix}"
+
+    if agent == "gemini" and ("ModelNotFoundError" in text or "Requested entity was not found" in text):
+        override["manual_disabled"] = True
+        override["disabled_until"] = ""
+        ok, err = _try_save_config(cfg)
+        suffix = "" if ok else f" (warning: could not persist config: {err})"
+        return f"auto-down: {agent} manual (model not found). Fix model then run /service up {agent}.{suffix}"
+
+    return None
+
+
+def _role_chain(role: str, cfg: dict) -> list[str]:
+    configured = list(cfg["chains"].get(role, []))
+    filtered = [a for a in configured if _available(a, cfg) and not _service_disabled_reason(a, cfg)]
+    if filtered:
+        return filtered
+    defaults = [a for a in DEFAULTS["chains"][role] if _available(a, cfg) and not _service_disabled_reason(a, cfg)]
+    if defaults:
+        return defaults
+    return [a for a in AGENTS if _available(a, cfg) and not _service_disabled_reason(a, cfg)]
+
+
+def _extract_openai_text(resp: object) -> str:
+    output_text = getattr(resp, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+    try:
+        output = getattr(resp, "output", None) or []
+        chunks: list[str] = []
+        for item in output:
+            content = getattr(item, "content", None) or []
+            for c in content:
+                text = getattr(c, "text", None)
+                if isinstance(text, str):
+                    chunks.append(text)
+        return "\n".join(chunks).strip()
+    except Exception:
+        return str(resp)
+
+
+def _call_codex_api(prompt: str, cfg: dict, role: str) -> str:
+    from openai import OpenAI  # type: ignore
+
+    model = cfg["models"]["codex_orchestrator"] if role == "orchestrator" else cfg["models"]["codex"]
+    client = OpenAI(api_key=cfg["keys"]["openai"])
+    resp = client.responses.create(model=model, input=prompt)
+    out = _extract_openai_text(resp)
+    return out or "<empty response>"
+
+
+def _call_codex_cli(prompt: str, cfg: dict) -> str:
+    if shutil.which("codex") is None:
+        raise RuntimeError("Codex CLI not found on PATH")
+    cli_cwd = _cli_workdir(cfg)
+    allowed = _allowed_dirs(cfg)
+    with tempfile.NamedTemporaryFile(prefix="daniel-codex-", suffix=".txt", delete=False) as tmp:
+        out_path = tmp.name
+    cmd = [
+        "codex",
+        "exec",
+        "--full-auto",
+        "--sandbox",
+        "workspace-write",
+        "--cd",
+        cli_cwd or str(Path.home()),
+        "--skip-git-repo-check",
+        "--color",
+        "never",
+        "-o",
+        out_path,
+    ]
+    for d in allowed:
+        cmd.extend(["--add-dir", d])
+    cmd.append(prompt)
+    proc = subprocess.run(
+        cmd,
+        cwd=cli_cwd,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip() or (proc.stdout or "").strip() or f"exit {proc.returncode}"
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"codex CLI failed: {err}")
+    out = _read(Path(out_path)).strip()
+    try:
+        os.remove(out_path)
+    except OSError:
+        pass
+    return out or "<empty response>"
+
+
+def _call_codex(prompt: str, cfg: dict, role: str) -> str:
+    mode = cfg.get("codex_mode", "api")
+    if mode == "api":
+        return _call_codex_api(prompt, cfg, role)
+    if mode == "cli":
+        return _call_codex_cli(prompt, cfg)
+    raise RuntimeError(f"Unsupported codex_mode: {mode}")
+
+
+def _call_claude_api(prompt: str, cfg: dict) -> str:
+    from anthropic import Anthropic  # type: ignore
+
+    client = Anthropic(api_key=cfg["keys"]["anthropic"])
+    resp = client.messages.create(
+        model=cfg["models"]["claude"],
+        max_tokens=2200,
+        temperature=0,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    chunks: list[str] = []
+    for block in getattr(resp, "content", []):
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            chunks.append(text)
+    return "\n".join(chunks).strip() or "<empty response>"
+
+
+def _call_claude_cli(prompt: str, cfg: dict) -> str:
+    if shutil.which("claude") is None:
+        raise RuntimeError("Claude CLI not found on PATH")
+    cli_cwd = _cli_workdir(cfg)
+    allowed = _allowed_dirs(cfg)
+    cmd = [
+        "claude",
+        "-p",
+        "--output-format",
+        "text",
+        "--allow-dangerously-skip-permissions",
+        "--dangerously-skip-permissions",
+        "--permission-mode",
+        "bypassPermissions",
+        "--add-dir",
+        *(allowed or [cli_cwd or str(Path.home())]),
+        "--model",
+        cfg["models"]["claude"],
+        prompt,
+    ]
+    env = os.environ.copy()
+    env.pop("CLAUDECODE", None)
+    proc = subprocess.run(
+        cmd,
+        cwd=cli_cwd,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        env=env,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip() or (proc.stdout or "").strip() or f"exit {proc.returncode}"
+        raise RuntimeError(f"claude CLI failed: {err}")
+    out = (proc.stdout or "").strip()
+    return out or "<empty response>"
+
+
+def _call_claude(prompt: str, cfg: dict) -> str:
+    mode = cfg.get("claude_mode", "cli")
+    if mode == "api":
+        return _call_claude_api(prompt, cfg)
+    if mode == "cli":
+        return _call_claude_cli(prompt, cfg)
+    raise RuntimeError(f"Unsupported claude_mode: {mode}")
+
+
+def _call_gemini_api(prompt: str, cfg: dict) -> str:
+    from google import genai  # type: ignore
+
+    client = genai.Client(api_key=cfg["keys"]["gemini"])
+    resp = client.models.generate_content(model=cfg["models"]["gemini"], contents=prompt)
+    text = getattr(resp, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    return str(resp)
+
+
+def _call_gemini_cli(prompt: str, cfg: dict) -> str:
+    if shutil.which("gemini") is None:
+        raise RuntimeError("Gemini CLI not found on PATH")
+    cli_cwd = _cli_workdir(cfg)
+    cmd = [
+        "gemini",
+        "-p",
+        prompt,
+        "--model",
+        cfg["models"]["gemini"],
+        "--output-format",
+        "json",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cli_cwd,
+            capture_output=True,
+            text=True,
+            timeout=GEMINI_CLI_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"gemini CLI timed out after {GEMINI_CLI_TIMEOUT_SECS}s")
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip() or (proc.stdout or "").strip() or f"exit {proc.returncode}"
+        raise RuntimeError(f"gemini CLI failed: {err}")
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        return "<empty response>"
+    # Gemini CLI JSON mode can return JSON object/array; keep best-effort parse.
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            for key in ("text", "content", "response"):
+                val = parsed.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        if isinstance(parsed, list) and parsed:
+            last = parsed[-1]
+            if isinstance(last, dict):
+                for key in ("text", "content", "response"):
+                    val = last.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+    except Exception:
+        pass
+    return raw
+
+
+def _call_gemini(prompt: str, cfg: dict) -> str:
+    mode = cfg.get("gemini_mode", "api")
+    if mode == "api":
+        return _call_gemini_api(prompt, cfg)
+    if mode == "cli":
+        return _call_gemini_cli(prompt, cfg)
+    raise RuntimeError(f"Unsupported gemini_mode: {mode}")
+
+
+def _call_agent(agent: str, prompt: str, cfg: dict, role: str) -> str:
+    if agent == "codex":
+        return _call_codex(prompt, cfg, role)
+    if agent == "claude":
+        return _call_claude(prompt, cfg)
+    if agent == "gemini":
+        return _call_gemini(prompt, cfg)
+    raise RuntimeError(f"Unknown agent: {agent}")
+
+
+def _known_tasks(tasks_root: Path) -> list[str]:
+    if not tasks_root.exists():
+        return []
+    names: list[str] = []
+    for p in sorted(tasks_root.iterdir()):
+        if not p.is_dir() or p.name.startswith("."):
+            continue
+        if (p / "TASK.md").exists():
+            names.append(p.name)
+    return names
+
+
+def _truncate(text: str, max_chars: int = 4000) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 40].rstrip() + "\n...[truncated]"
+
+
+def _normalize_dir(raw: str) -> str:
+    return str(Path(raw).expanduser().resolve())
+
+
+def _allowed_dirs(cfg: dict) -> list[str]:
+    dirs = cfg.get("allowed_dirs", [])
+    out: list[str] = []
+    for d in dirs:
+        try:
+            n = _normalize_dir(str(d))
+        except Exception:
+            continue
+        if n not in out:
+            out.append(n)
+    return out
+
+
+def _is_allowed_dir(path: Path, cfg: dict) -> bool:
+    target = path.resolve()
+    for base_raw in _allowed_dirs(cfg):
+        base = Path(base_raw)
+        try:
+            target.relative_to(base)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _cli_workdir(cfg: dict) -> str | None:
+    tasks_root = Path(cfg["tasks_root"]).expanduser()
+    if tasks_root.exists() and _is_allowed_dir(tasks_root, cfg):
+        return str(tasks_root)
+    for d in _allowed_dirs(cfg):
+        p = Path(d)
+        if p.exists() and p.is_dir():
+            return str(p)
+    return str(tasks_root) if tasks_root.exists() else None
+
+
+def _shared_context(tasks_root: Path, task_id: str | None) -> str:
+    sections: list[str] = []
+    global_files = [
+        ("Global Guardrails", tasks_root / "GUARDRAILS.md"),
+        ("Global Todo", tasks_root / "TODO_GLOBAL.md"),
+        ("Global MCP", tasks_root / "MCP_SERVERS.md"),
+        ("Shared Knowledge", tasks_root / "SHARED_KNOWLEDGE.md"),
+    ]
+    for label, path in global_files:
+        raw = _read(path).strip()
+        if raw:
+            sections.append(f"## {label}\n{_truncate(raw, 5000)}")
+
+    if task_id:
+        task_dir = tasks_root / task_id
+        for label, name in [
+            ("Task", "TASK.md"),
+            ("Task Plan", "PLAN.md"),
+            ("Task Decision", "DECISION.md"),
+            ("Task Todo", "TODO.md"),
+            ("Task Guardrails", "GUARDRAILS.md"),
+            ("Task MCP", "MCP_SERVERS.md"),
+        ]:
+            raw = _read(task_dir / name).strip()
+            if raw:
+                sections.append(f"## {label}\n{_truncate(raw, 5000)}")
+
+    tasks = _known_tasks(tasks_root)
+    if tasks:
+        sections.append("## Known Tasks\n" + "\n".join(f"- {t}" for t in tasks[:200]))
+    return "\n\n".join(sections)
+
+
+def _build_prompt(role: str, user_text: str, history: list[dict], shared: str) -> str:
+    hist = history[-8:]
+    hist_text = "\n".join(f"{m['role']}: {m['text']}" for m in hist)
+    return (
+        "You are Daniel, a pragmatic software assistant.\n"
+        f"Current role: {role}.\n"
+        "Use concise, actionable outputs.\n"
+        "Respect guardrails and todo/context.\n\n"
+        "SHARED CONTEXT:\n"
+        f"{shared}\n\n"
+        "RECENT CHAT:\n"
+        f"{hist_text}\n\n"
+        "USER:\n"
+        f"{user_text}\n"
+    )
+
+
+def _render_response_block(agent: str, role: str, text: str) -> str:
+    ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    lines = [
+        "",
+        f"=== response: {agent} | role={role} | ts={ts} ===",
+        text.rstrip() or "<empty response>",
+        "=== end response ===",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _call_agent_with_spinner(agent: str, prompt: str, cfg: dict, role: str) -> str:
+    done = threading.Event()
+
+    def _spin() -> None:
+        frames = ("|", "/", "-", "\\")
+        i = 0
+        while not done.is_set():
+            sys.stdout.write(f"\rthinking {frames[i % len(frames)]} agent={agent} role={role}")
+            sys.stdout.flush()
+            time.sleep(0.12)
+            i += 1
+        sys.stdout.write("\r" + " " * 72 + "\r")
+        sys.stdout.flush()
+
+    t = threading.Thread(target=_spin, daemon=True)
+    t.start()
+    try:
+        return _call_agent(agent, prompt, cfg, role)
+    finally:
+        done.set()
+        t.join(timeout=1)
+
+
+def _smoke_test(cfg: dict, task_id: str | None) -> int:
+    prompt = "Reply with exactly: smoke-ok"
+    role = "orchestrator"
+    history: list[dict] = [{"role": "user", "text": prompt}]
+    shared = _shared_context(Path(cfg["tasks_root"]).expanduser(), task_id)
+    built = _build_prompt(role, prompt, history, shared)
+    print("Smoke test start")
+    rc = 0
+    for agent in AGENTS:
+        status = _service_status(agent, cfg)
+        if status.startswith("down") or status.startswith("unavailable"):
+            print(f"- {agent}: skipped ({status})")
+            continue
+        try:
+            out = _call_agent_with_spinner(agent, built, cfg, role)
+            first = (out or "").strip().splitlines()
+            sample = first[0] if first else "<empty response>"
+            print(f"- {agent}: ok -> {sample[:120]}")
+        except Exception as exc:
+            rc = 1
+            print(f"- {agent}: failed -> {exc}")
+    print("Smoke test done")
+    return rc
+
+
+def _write_tasks_env(cfg: dict) -> None:
+    tasks_root = Path(cfg["tasks_root"]).expanduser()
+    env_path = tasks_root / ".env"
+    lines = [
+        f"OPENAI_API_KEY={cfg['keys']['openai']}",
+        f"ANTHROPIC_API_KEY={cfg['keys']['anthropic']}",
+        f"GEMINI_API_KEY={cfg['keys']['gemini']}",
+        "",
+        f"OPENAI_MODEL_CODEX={cfg['models']['codex']}",
+        f"OPENAI_MODEL_ORCHESTRATOR_FALLBACK={cfg['models']['codex_orchestrator']}",
+        f"ANTHROPIC_MODEL_ORCHESTRATOR={cfg['models']['claude']}",
+        f"GEMINI_MODEL_UI_DOCS={cfg['models']['gemini']}",
+        "",
+        f"ORCHESTRATOR_CHAIN={','.join(cfg['chains']['orchestrator'])}",
+        f"IMPLEMENTATION_CHAIN={','.join(cfg['chains']['implementation'])}",
+        f"UIDOCS_CHAIN={','.join(cfg['chains']['uidocs'])}",
+        f"REVIEW_CHAIN={','.join(cfg['chains']['review'])}",
+        "SHARED_CONTEXT_MAX_SECTION_CHARS=6000",
+    ]
+    _write(env_path, "\n".join(lines) + "\n")
+    os.chmod(env_path, 0o600)
+
+
+def _run_init_shared(tasks_root: Path) -> None:
+    script = tasks_root / "orchestrator.py"
+    if not script.exists():
+        return
+    subprocess.run([sys.executable, str(script), "init-shared"], check=False)
+
+
+def _prompt(label: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    val = input(f"{label}{suffix}: ").strip()
+    return val if val else default
+
+
+def setup_wizard(cfg: dict, force: bool = False) -> dict:
+    print("\nDaniel setup wizard")
+    print("Configure API and/or CLI providers. At least one usable provider is required.\n")
+
+    tasks_root = Path(_prompt("Tasks root", cfg["tasks_root"]))
+    cfg["tasks_root"] = str(tasks_root)
+    claude_mode = _prompt("Claude mode (cli/api)", cfg.get("claude_mode", "cli")).lower()
+    if claude_mode not in ("cli", "api"):
+        claude_mode = "cli"
+    cfg["claude_mode"] = claude_mode
+    codex_mode = _prompt("Codex mode (api/cli)", cfg.get("codex_mode", "api")).lower()
+    if codex_mode not in ("api", "cli"):
+        codex_mode = "api"
+    cfg["codex_mode"] = codex_mode
+    gemini_mode = _prompt("Gemini mode (api/cli)", cfg.get("gemini_mode", "api")).lower()
+    if gemini_mode not in ("api", "cli"):
+        gemini_mode = "api"
+    cfg["gemini_mode"] = gemini_mode
+
+    existing_openai = cfg["keys"]["openai"] if cfg["keys"]["openai"] and not force else ""
+    existing_anthropic = cfg["keys"]["anthropic"] if cfg["keys"]["anthropic"] and not force else ""
+    existing_gemini = cfg["keys"]["gemini"] if cfg["keys"]["gemini"] and not force else ""
+
+    oai_label = "OpenAI API key"
+    if cfg["codex_mode"] == "cli":
+        oai_label += " (optional in cli mode)"
+    oai = getpass(f"{oai_label}{' [press Enter to keep existing]' if existing_openai else ''}: ").strip()
+    ant_label = "Anthropic API key"
+    if cfg["claude_mode"] == "cli":
+        ant_label += " (optional in cli mode)"
+    ant = getpass(f"{ant_label}{' [press Enter to keep existing]' if existing_anthropic else ''}: ").strip()
+    gem_label = "Gemini API key"
+    if cfg["gemini_mode"] == "cli":
+        gem_label += " (optional in cli mode)"
+    gem = getpass(f"{gem_label}{' [press Enter to keep existing]' if existing_gemini else ''}: ").strip()
+
+    cfg["keys"]["openai"] = oai or existing_openai
+    cfg["keys"]["anthropic"] = ant or existing_anthropic
+    cfg["keys"]["gemini"] = gem or existing_gemini
+
+    has_provider = any(v.strip() for v in cfg["keys"].values())
+    if cfg["claude_mode"] == "cli" and shutil.which("claude"):
+        has_provider = True
+    if cfg["codex_mode"] == "cli" and shutil.which("codex"):
+        has_provider = True
+    if cfg["gemini_mode"] == "cli" and shutil.which("gemini"):
+        has_provider = True
+    if not has_provider:
+        raise RuntimeError(
+            "No usable provider configured. Add at least one API key, or use Claude/Codex/Gemini in cli mode with their CLIs installed."
+        )
+
+    print("\nModel IDs (use exact account IDs if custom):")
+    cfg["models"]["claude"] = _prompt("Claude model", cfg["models"]["claude"])
+    cfg["models"]["codex"] = _prompt("Codex model", cfg["models"]["codex"])
+    cfg["models"]["codex_orchestrator"] = _prompt(
+        "Codex fallback orchestrator model", cfg["models"]["codex_orchestrator"]
+    )
+    cfg["models"]["gemini"] = _prompt("Gemini model", cfg["models"]["gemini"])
+
+    print("\nRole fallback chains (comma separated, values: claude,codex,gemini):")
+    cfg["chains"]["orchestrator"] = _parse_chain(
+        _prompt("ORCHESTRATOR_CHAIN", ",".join(cfg["chains"]["orchestrator"])),
+        DEFAULTS["chains"]["orchestrator"],
+    )
+    cfg["chains"]["implementation"] = _parse_chain(
+        _prompt("IMPLEMENTATION_CHAIN", ",".join(cfg["chains"]["implementation"])),
+        DEFAULTS["chains"]["implementation"],
+    )
+    cfg["chains"]["uidocs"] = _parse_chain(
+        _prompt("UIDOCS_CHAIN", ",".join(cfg["chains"]["uidocs"])),
+        DEFAULTS["chains"]["uidocs"],
+    )
+    cfg["chains"]["review"] = _parse_chain(
+        _prompt("REVIEW_CHAIN", ",".join(cfg["chains"]["review"])),
+        DEFAULTS["chains"]["review"],
+    )
+
+    _save_config(cfg)
+    _write_tasks_env(cfg)
+    _run_init_shared(tasks_root)
+    print(f"\nSaved: {CONFIG_PATH}")
+    print(f"Synced env: {tasks_root / '.env'}\n")
+    return cfg
+
+
+def _run_orchestrator(task_id: str, cfg: dict) -> int:
+    tasks_root = Path(cfg["tasks_root"]).expanduser()
+    script = tasks_root / "orchestrator.py"
+    if not script.exists():
+        print(f"orchestrator.py not found at {script}")
+        return 1
+    env = os.environ.copy()
+    env["OPENAI_API_KEY"] = cfg["keys"]["openai"]
+    env["ANTHROPIC_API_KEY"] = cfg["keys"]["anthropic"]
+    env["GEMINI_API_KEY"] = cfg["keys"]["gemini"]
+    env["OPENAI_MODEL_CODEX"] = cfg["models"]["codex"]
+    env["OPENAI_MODEL_ORCHESTRATOR_FALLBACK"] = cfg["models"]["codex_orchestrator"]
+    env["ANTHROPIC_MODEL_ORCHESTRATOR"] = cfg["models"]["claude"]
+    env["GEMINI_MODEL_UI_DOCS"] = cfg["models"]["gemini"]
+    env["ORCHESTRATOR_CHAIN"] = ",".join(cfg["chains"]["orchestrator"])
+    env["IMPLEMENTATION_CHAIN"] = ",".join(cfg["chains"]["implementation"])
+    env["UIDOCS_CHAIN"] = ",".join(cfg["chains"]["uidocs"])
+    env["REVIEW_CHAIN"] = ",".join(cfg["chains"]["review"])
+    unsupported_for_orchestrator: set[str] = set()
+    if cfg.get("claude_mode", "cli") == "cli":
+        unsupported_for_orchestrator.add("claude")
+    if cfg.get("codex_mode", "api") == "cli":
+        unsupported_for_orchestrator.add("codex")
+    if cfg.get("gemini_mode", "api") == "cli":
+        unsupported_for_orchestrator.add("gemini")
+    if unsupported_for_orchestrator:
+        for role_key in ("orchestrator", "implementation", "uidocs", "review"):
+            chain_key = f"{role_key.upper()}_CHAIN"
+            agents = [a for a in env[chain_key].split(",") if a and a not in unsupported_for_orchestrator]
+            env[chain_key] = ",".join(agents)
+    print(f"Running orchestrator for task '{task_id}'...")
+    proc = subprocess.run([sys.executable, str(script), "run", "--task-id", task_id], env=env)
+    return proc.returncode
+
+
+def _chat_once(role: str, message: str, cfg: dict, history: list[dict], task_id: str | None) -> tuple[str, str, list[str]]:
+    chain = _role_chain(role, cfg)
+    if not chain:
+        raise RuntimeError("No available agents for this role. Add at least one API key in /setup.")
+
+    shared = _shared_context(Path(cfg["tasks_root"]).expanduser(), task_id)
+    prompt = _build_prompt(role, message, history, shared)
+    failures: list[str] = []
+    for agent in chain:
+        try:
+            out = _call_agent_with_spinner(agent, prompt, cfg, role)
+            return agent, out, failures
+        except Exception as exc:
+            failures.append(f"{agent}: {exc}")
+            auto_note = _apply_auto_downtime(agent, str(exc), cfg)
+            if auto_note:
+                failures.append(auto_note)
+    raise RuntimeError("All agents failed: " + " | ".join(failures))
+
+
+def _print_help() -> None:
+    print("Commands:")
+    print("  /help                 show help")
+    print("  /setup                rerun setup wizard")
+    print("  /models               show models")
+    print("  /chains               show role chains")
+    print("  /task                 show current task")
+    print("  /task list            list known tasks")
+    print("  /task <id>            switch task (auto scaffold if missing)")
+    print("  /run                  run orchestrator for current task")
+    print("  /smoke                run smoke test across enabled providers")
+    print("  /service status       list provider status (up/down/unavailable)")
+    print("  /service down <agent> <minutes>")
+    print("  /service down <agent> manual")
+    print("  /service up <agent>   re-enable provider immediately")
+    print("  /allow-dir list       list approved directories")
+    print("  /allow-dir add <path> approve a directory subtree")
+    print("  /allow-dir rm <path>  remove an approved directory")
+    print("  /quit                 exit")
+    print("  impl: <msg>           force implementation role")
+    print("  ui: <msg>             force ui/docs role")
+
+
+def run_chat(cfg: dict, initial_task: str | None) -> int:
+    task_id = initial_task
+    history: list[dict] = []
+    print("Daniel ready. Type /help for commands.")
+
+    while True:
+        try:
+            raw = input("daniel> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+
+        if not raw:
+            continue
+        if raw == "/quit":
+            return 0
+        if raw == "/help":
+            _print_help()
+            continue
+        if raw == "/setup":
+            try:
+                cfg = setup_wizard(cfg, force=False)
+            except Exception as exc:
+                print(f"Setup failed: {exc}")
+            continue
+        if raw == "/models":
+            payload = {
+                "claude_mode": cfg.get("claude_mode", "cli"),
+                "codex_mode": cfg.get("codex_mode", "api"),
+                "gemini_mode": cfg.get("gemini_mode", "api"),
+                "models": cfg["models"],
+            }
+            print(json.dumps(payload, indent=2))
+            continue
+        if raw == "/chains":
+            print(json.dumps(cfg["chains"], indent=2))
+            continue
+        if raw == "/smoke":
+            rc = _smoke_test(cfg, task_id)
+            print(f"smoke exit code: {rc}")
+            continue
+        if raw == "/service status":
+            changed = False
+            for agent in AGENTS:
+                before = cfg["service_overrides"][agent].get("disabled_until", "")
+                status = _service_status(agent, cfg)
+                after = cfg["service_overrides"][agent].get("disabled_until", "")
+                if before != after:
+                    changed = True
+                print(f"- {agent}: {status}")
+            if changed:
+                ok, err = _try_save_config(cfg)
+                if not ok:
+                    print(f"warning: could not persist config: {err}")
+            continue
+        if raw == "/allow-dir list":
+            dirs = _allowed_dirs(cfg)
+            if not dirs:
+                print("No approved directories.")
+            else:
+                for d in dirs:
+                    print(f"- {d}")
+            continue
+        if raw.startswith("/allow-dir add "):
+            path_raw = raw.split(" ", 2)[2].strip()
+            if not path_raw:
+                print("Usage: /allow-dir add <path>")
+                continue
+            try:
+                normalized = _normalize_dir(path_raw)
+            except Exception as exc:
+                print(f"invalid path: {exc}")
+                continue
+            dirs = _allowed_dirs(cfg)
+            if normalized not in dirs:
+                dirs.append(normalized)
+            cfg["allowed_dirs"] = dirs
+            ok, err = _try_save_config(cfg)
+            if not ok:
+                print(f"warning: could not persist config: {err}")
+            print(f"approved: {normalized}")
+            continue
+        if raw.startswith("/allow-dir rm "):
+            path_raw = raw.split(" ", 2)[2].strip()
+            if not path_raw:
+                print("Usage: /allow-dir rm <path>")
+                continue
+            try:
+                normalized = _normalize_dir(path_raw)
+            except Exception as exc:
+                print(f"invalid path: {exc}")
+                continue
+            dirs = [d for d in _allowed_dirs(cfg) if d != normalized]
+            cfg["allowed_dirs"] = dirs
+            ok, err = _try_save_config(cfg)
+            if not ok:
+                print(f"warning: could not persist config: {err}")
+            print(f"removed: {normalized}")
+            continue
+        if raw.startswith("/service down "):
+            parts = raw.split()
+            if len(parts) != 4:
+                print("Usage: /service down <claude|codex|gemini> <minutes|manual>")
+                continue
+            _, _, agent, value = parts
+            if agent not in AGENTS:
+                print("Unknown agent. Use claude, codex, or gemini.")
+                continue
+            override = cfg["service_overrides"][agent]
+            if value == "manual":
+                override["manual_disabled"] = True
+                override["disabled_until"] = ""
+                ok, err = _try_save_config(cfg)
+                if not ok:
+                    print(f"warning: could not persist config: {err}")
+                print(f"{agent} set to manual down. Use /service up {agent} to re-enable.")
+                continue
+            try:
+                minutes = int(value)
+                if minutes <= 0:
+                    raise ValueError
+            except ValueError:
+                print("Minutes must be a positive integer, or use 'manual'.")
+                continue
+            until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+            override["manual_disabled"] = False
+            override["disabled_until"] = _format_iso_utc(until)
+            ok, err = _try_save_config(cfg)
+            if not ok:
+                print(f"warning: could not persist config: {err}")
+            print(f"{agent} down until {override['disabled_until']}")
+            continue
+        if raw.startswith("/service up "):
+            parts = raw.split()
+            if len(parts) != 3:
+                print("Usage: /service up <claude|codex|gemini>")
+                continue
+            _, _, agent = parts
+            if agent not in AGENTS:
+                print("Unknown agent. Use claude, codex, or gemini.")
+                continue
+            override = cfg["service_overrides"][agent]
+            override["manual_disabled"] = False
+            override["disabled_until"] = ""
+            ok, err = _try_save_config(cfg)
+            if not ok:
+                print(f"warning: could not persist config: {err}")
+            print(f"{agent} re-enabled.")
+            continue
+        if raw == "/task":
+            print(f"Current task: {task_id or '(none)'}")
+            continue
+        if raw == "/task list":
+            names = _known_tasks(Path(cfg["tasks_root"]))
+            if not names:
+                print("No tasks found.")
+            else:
+                for n in names:
+                    print(f"- {n}")
+            continue
+        if raw.startswith("/task "):
+            requested = raw.split(" ", 1)[1].strip()
+            if not requested:
+                print("Usage: /task <id>")
+                continue
+            task_dir = Path(cfg["tasks_root"]) / requested
+            if not task_dir.exists():
+                script = Path(cfg["tasks_root"]) / "orchestrator.py"
+                if script.exists():
+                    subprocess.run([sys.executable, str(script), "scaffold", "--task-id", requested], check=False)
+            task_id = requested
+            print(f"Switched task: {task_id}")
+            continue
+        if raw == "/run":
+            if not task_id:
+                print("Set a task first with /task <id>")
+                continue
+            rc = _run_orchestrator(task_id, cfg)
+            print(f"orchestrator exit code: {rc}")
+            continue
+
+        role = "orchestrator"
+        user_text = raw
+        if raw.lower().startswith("impl:"):
+            role = "implementation"
+            user_text = raw[5:].strip()
+        elif raw.lower().startswith("ui:"):
+            role = "uidocs"
+            user_text = raw[3:].strip()
+
+        history.append({"role": "user", "text": user_text})
+        try:
+            agent, out, failures = _chat_once(role, user_text, cfg, history, task_id)
+            print(_render_response_block(agent, role, out))
+            if failures:
+                print(f"fallbacks: {' | '.join(failures)}\n")
+            history.append({"role": "assistant", "text": out})
+            history[:] = history[-20:]
+        except Exception as exc:
+            print(f"error: {exc}\n")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Daniel terminal assistant")
+    parser.add_argument("--setup", action="store_true", help="run setup wizard and exit")
+    parser.add_argument("--task", default="", help="initial task id")
+    args = parser.parse_args()
+
+    cfg = _load_config()
+    if args.setup or not CONFIG_PATH.exists():
+        try:
+            cfg = setup_wizard(cfg, force=False)
+        except Exception as exc:
+            print(f"Setup failed: {exc}")
+            return 1
+        if args.setup:
+            return 0
+
+    return run_chat(cfg, args.task or None)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
