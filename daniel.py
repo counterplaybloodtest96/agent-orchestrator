@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Daniel: local multi-agent terminal assistant with fallback chains."""
+"""Multi-agent terminal orchestrator with CLI wrapping and next-man-up failover."""
 
 from __future__ import annotations
 
@@ -13,17 +13,21 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
+import urllib.parse
 from getpass import getpass
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 AGENTS = ("claude", "codex", "gemini")
-GEMINI_CLI_TIMEOUT_SECS = 120
+GEMINI_CLI_TIMEOUT_SECS = 300  # 5 minutes (was 120 — too short for complex prompts)
 DEFAULTS = {
-    "tasks_root": "/home/shawn/tasks",
+    "name": "agent",
+    "tasks_root": str(Path.home() / "tasks"),
+    "kb_port": "3838",
     "claude_mode": "cli",
-    "codex_mode": "api",
-    "gemini_mode": "api",
+    "codex_mode": "cli",
+    "gemini_mode": "cli",
     "models": {
         "claude": "claude-sonnet-4-5",
         "codex": "gpt-5",
@@ -46,11 +50,20 @@ DEFAULTS = {
         "codex": {"manual_disabled": False, "disabled_until": ""},
         "gemini": {"manual_disabled": False, "disabled_until": ""},
     },
-    "allowed_dirs": ["/home/shawn"],
+    "allowed_dirs": [str(Path.home())],
 }
 
-CONFIG_DIR = Path.home() / ".config" / "daniel"
+CONFIG_DIR = Path.home() / ".config" / "agent-orchestrator"
 CONFIG_PATH = CONFIG_DIR / "config.json"
+# Backward compat: check old location
+_OLD_CONFIG = Path.home() / ".config" / "daniel" / "config.json"
+
+# --- Terminal colors (disabled if not a TTY) ---
+_COLORS = sys.stdout.isatty()
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _COLORS else text
+
+AGENT_COLORS = {"claude": "35", "codex": "32", "gemini": "34"}  # magenta, green, blue
 
 
 def _read(path: Path) -> str:
@@ -65,12 +78,18 @@ def _write(path: Path, content: str) -> None:
 
 
 def _load_config() -> dict:
-    if not CONFIG_PATH.exists():
+    # Check old config location for backward compat
+    path = CONFIG_PATH
+    if not path.exists() and _OLD_CONFIG.exists():
+        path = _OLD_CONFIG
+    if not path.exists():
         return json.loads(json.dumps(DEFAULTS))
-    raw = json.loads(_read(CONFIG_PATH))
+    raw = json.loads(_read(path))
     cfg = json.loads(json.dumps(DEFAULTS))
     for top in (
+        "name",
         "tasks_root",
+        "kb_port",
         "claude_mode",
         "codex_mode",
         "gemini_mode",
@@ -95,7 +114,7 @@ def _load_config() -> dict:
         ov.setdefault("manual_disabled", False)
         ov.setdefault("disabled_until", "")
     if not isinstance(cfg.get("allowed_dirs"), list):
-        cfg["allowed_dirs"] = ["/home/shawn"]
+        cfg["allowed_dirs"] = [str(Path.home())]
     cfg["allowed_dirs"] = [str(Path(p).expanduser()) for p in cfg["allowed_dirs"] if str(p).strip()]
     return cfg
 
@@ -234,12 +253,37 @@ def _apply_auto_downtime(agent: str, error_text: str, cfg: dict) -> str | None:
             suffix = "" if ok else f" (warning: could not persist config: {err})"
             return f"auto-down: {agent} until {override['disabled_until']}{suffix}"
 
-    if agent == "gemini" and ("ModelNotFoundError" in text or "Requested entity was not found" in text):
-        override["manual_disabled"] = True
-        override["disabled_until"] = ""
-        ok, err = _try_save_config(cfg)
-        suffix = "" if ok else f" (warning: could not persist config: {err})"
-        return f"auto-down: {agent} manual (model not found). Fix model then run /service up {agent}.{suffix}"
+    if agent == "gemini":
+        lower = text.lower()
+        if "modelnot found" in lower or "requested entity was not found" in lower or "model not found" in lower:
+            override["manual_disabled"] = True
+            override["disabled_until"] = ""
+            ok, err = _try_save_config(cfg)
+            suffix = "" if ok else f" (warning: could not persist config: {err})"
+            return f"auto-down: {agent} manual (model not found). Fix model then run /service up {agent}.{suffix}"
+        if "resource_exhausted" in lower or "quota" in lower or "rate limit" in lower:
+            override["disabled_until"] = _format_iso_utc(datetime.now(timezone.utc) + timedelta(minutes=5))
+            ok, err = _try_save_config(cfg)
+            suffix = "" if ok else f" (warning: could not persist config: {err})"
+            return f"auto-down: {agent} rate limited, retry in 5min{suffix}"
+        if "permission_denied" in lower or "api_key_invalid" in lower or "unauthorized" in lower:
+            override["manual_disabled"] = True
+            ok, err = _try_save_config(cfg)
+            suffix = "" if ok else f" (warning: could not persist config: {err})"
+            return f"auto-down: {agent} auth failed. Check API key then /service up {agent}.{suffix}"
+
+    if agent == "codex":
+        lower = text.lower()
+        if "rate limit" in lower or "429" in lower or "resource exhausted" in lower:
+            override["disabled_until"] = _format_iso_utc(datetime.now(timezone.utc) + timedelta(minutes=5))
+            ok, err = _try_save_config(cfg)
+            suffix = "" if ok else f" (warning: could not persist config: {err})"
+            return f"auto-down: {agent} rate limited, retry in 5min{suffix}"
+        if "authentication" in lower or "401" in lower or "invalid api key" in lower:
+            override["manual_disabled"] = True
+            ok, err = _try_save_config(cfg)
+            suffix = "" if ok else f" (warning: could not persist config: {err})"
+            return f"auto-down: {agent} auth failed. Check API key then /service up {agent}.{suffix}"
 
     return None
 
@@ -417,14 +461,12 @@ def _call_gemini_cli(prompt: str, cfg: dict) -> str:
     if shutil.which("gemini") is None:
         raise RuntimeError("Gemini CLI not found on PATH")
     cli_cwd = _cli_workdir(cfg)
+    # Pass prompt via -p flag (Gemini CLI headless mode)
+    # Use text output format for reliability — JSON parsing was fragile
     cmd = [
         "gemini",
-        "-p",
-        prompt,
-        "--model",
-        cfg["models"]["gemini"],
-        "--output-format",
-        "json",
+        "-p", prompt,
+        "--model", cfg["models"]["gemini"],
     ]
     try:
         proc = subprocess.run(
@@ -441,23 +483,29 @@ def _call_gemini_cli(prompt: str, cfg: dict) -> str:
         raise RuntimeError(f"gemini CLI failed: {err}")
     raw = (proc.stdout or "").strip()
     if not raw:
+        # Check stderr for clues
+        stderr = (proc.stderr or "").strip()
+        if stderr:
+            raise RuntimeError(f"gemini CLI empty output, stderr: {stderr}")
         return "<empty response>"
-    # Gemini CLI JSON mode can return JSON object/array; keep best-effort parse.
+    # Try to extract text from JSON if Gemini returns structured output
     try:
         parsed = json.loads(raw)
+        # Gemini CLI JSON format: candidates[0].content.parts[0].text
         if isinstance(parsed, dict):
+            candidates = parsed.get("candidates", [])
+            if candidates and isinstance(candidates, list):
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts and isinstance(parts, list):
+                    text = parts[0].get("text", "")
+                    if text.strip():
+                        return text.strip()
+            # Fallback: try flat keys
             for key in ("text", "content", "response"):
                 val = parsed.get(key)
                 if isinstance(val, str) and val.strip():
                     return val.strip()
-        if isinstance(parsed, list) and parsed:
-            last = parsed[-1]
-            if isinstance(last, dict):
-                for key in ("text", "content", "response"):
-                    val = last.get(key)
-                    if isinstance(val, str) and val.strip():
-                        return val.strip()
-    except Exception:
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError):
         pass
     return raw
 
@@ -539,7 +587,27 @@ def _cli_workdir(cfg: dict) -> str | None:
     return str(tasks_root) if tasks_root.exists() else None
 
 
-def _shared_context(tasks_root: Path, task_id: str | None) -> str:
+def _kb_search(query: str, cfg: dict, limit: int = 5) -> str:
+    """Search the knowledge base server if running. Returns empty string if KB unavailable."""
+    port = cfg.get("kb_port", "3838")
+    url = f"http://localhost:{port}/api/v1/search?q={urllib.parse.quote(query)}&limit={limit}"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            if not data:
+                return ""
+            results = []
+            for doc in data[:limit]:
+                title = doc.get("title", "Untitled")
+                snippet = doc.get("snippet", "")[:200].replace("<mark>", "").replace("</mark>", "")
+                results.append(f"- {title}: {snippet}")
+            return "\n".join(results)
+    except Exception:
+        return ""  # KB not running — silently skip
+
+
+def _shared_context(tasks_root: Path, task_id: str | None, cfg: dict | None = None) -> str:
     sections: list[str] = []
     global_files = [
         ("Global Guardrails", tasks_root / "GUARDRAILS.md"),
@@ -569,14 +637,21 @@ def _shared_context(tasks_root: Path, task_id: str | None) -> str:
     tasks = _known_tasks(tasks_root)
     if tasks:
         sections.append("## Known Tasks\n" + "\n".join(f"- {t}" for t in tasks[:200]))
+
+    # Inject KB context if server is running
+    if cfg and task_id:
+        kb_results = _kb_search(task_id, cfg, limit=5)
+        if kb_results:
+            sections.append(f"## Knowledge Base Context\n{kb_results}")
+
     return "\n\n".join(sections)
 
 
-def _build_prompt(role: str, user_text: str, history: list[dict], shared: str) -> str:
+def _build_prompt(role: str, user_text: str, history: list[dict], shared: str, name: str = "agent") -> str:
     hist = history[-8:]
     hist_text = "\n".join(f"{m['role']}: {m['text']}" for m in hist)
     return (
-        "You are Daniel, a pragmatic software assistant.\n"
+        f"You are {name.title()}, a pragmatic software assistant.\n"
         f"Current role: {role}.\n"
         "Use concise, actionable outputs.\n"
         "Respect guardrails and todo/context.\n\n"
@@ -590,27 +665,26 @@ def _build_prompt(role: str, user_text: str, history: list[dict], shared: str) -
 
 
 def _render_response_block(agent: str, role: str, text: str) -> str:
-    ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    lines = [
-        "",
-        f"=== response: {agent} | role={role} | ts={ts} ===",
-        text.rstrip() or "<empty response>",
-        "=== end response ===",
-        "",
-    ]
-    return "\n".join(lines)
+    ts = datetime.now(timezone.utc).replace(microsecond=0).strftime("%H:%M:%S")
+    color = AGENT_COLORS.get(agent, "37")
+    header = _c(color, f"  [{agent}]") + _c("90", f" {role} @ {ts}")
+    separator = _c("90", "  " + "-" * 60)
+    body = text.rstrip() or "<empty response>"
+    return f"\n{header}\n{separator}\n{body}\n"
 
 
 def _call_agent_with_spinner(agent: str, prompt: str, cfg: dict, role: str) -> str:
     done = threading.Event()
 
     def _spin() -> None:
-        frames = ("|", "/", "-", "\\")
+        frames = (".", "..", "...", "....", ".....")
         i = 0
         while not done.is_set():
-            sys.stdout.write(f"\rthinking {frames[i % len(frames)]} agent={agent} role={role}")
+            color = AGENT_COLORS.get(agent, "37")
+            msg = _c(color, f"  [{agent}]") + _c("90", f" thinking{frames[i % len(frames)]}")
+            sys.stdout.write(f"\r{msg}" + " " * 20)
             sys.stdout.flush()
-            time.sleep(0.12)
+            time.sleep(0.3)
             i += 1
         sys.stdout.write("\r" + " " * 72 + "\r")
         sys.stdout.flush()
@@ -628,8 +702,8 @@ def _smoke_test(cfg: dict, task_id: str | None) -> int:
     prompt = "Reply with exactly: smoke-ok"
     role = "orchestrator"
     history: list[dict] = [{"role": "user", "text": prompt}]
-    shared = _shared_context(Path(cfg["tasks_root"]).expanduser(), task_id)
-    built = _build_prompt(role, prompt, history, shared)
+    shared = _shared_context(Path(cfg["tasks_root"]).expanduser(), task_id, cfg)
+    built = _build_prompt(role, prompt, history, shared, cfg.get("name", "agent"))
     print("Smoke test start")
     rc = 0
     for agent in AGENTS:
@@ -686,9 +760,12 @@ def _prompt(label: str, default: str = "") -> str:
 
 
 def setup_wizard(cfg: dict, force: bool = False) -> dict:
-    print("\nDaniel setup wizard")
+    name = cfg.get("name", "agent")
+    print(f"\n{name.title()} setup wizard")
     print("Configure API and/or CLI providers. At least one usable provider is required.\n")
 
+    name = _prompt("Orchestrator name", name).lower().strip() or "agent"
+    cfg["name"] = name
     tasks_root = Path(_prompt("Tasks root", cfg["tasks_root"]))
     cfg["tasks_root"] = str(tasks_root)
     claude_mode = _prompt("Claude mode (cli/api)", cfg.get("claude_mode", "cli")).lower()
@@ -811,8 +888,8 @@ def _chat_once(role: str, message: str, cfg: dict, history: list[dict], task_id:
     if not chain:
         raise RuntimeError("No available agents for this role. Add at least one API key in /setup.")
 
-    shared = _shared_context(Path(cfg["tasks_root"]).expanduser(), task_id)
-    prompt = _build_prompt(role, message, history, shared)
+    shared = _shared_context(Path(cfg["tasks_root"]).expanduser(), task_id, cfg)
+    prompt = _build_prompt(role, message, history, shared, cfg.get("name", "agent"))
     failures: list[str] = []
     for agent in chain:
         try:
@@ -837,10 +914,11 @@ def _print_help() -> None:
     print("  /task <id>            switch task (auto scaffold if missing)")
     print("  /run                  run orchestrator for current task")
     print("  /smoke                run smoke test across enabled providers")
+    print("  /kb <query>           search the knowledge base")
     print("  /service status       list provider status (up/down/unavailable)")
-    print("  /service down <agent> <minutes>")
-    print("  /service down <agent> manual")
+    print("  /service down <agent> <minutes|manual>")
     print("  /service up <agent>   re-enable provider immediately")
+    print("  /service recover      re-enable all disabled providers")
     print("  /allow-dir list       list approved directories")
     print("  /allow-dir add <path> approve a directory subtree")
     print("  /allow-dir rm <path>  remove an approved directory")
@@ -852,11 +930,12 @@ def _print_help() -> None:
 def run_chat(cfg: dict, initial_task: str | None) -> int:
     task_id = initial_task
     history: list[dict] = []
-    print("Daniel ready. Type /help for commands.")
+    name = cfg.get("name", "agent")
+    print(f"{_c('1', name.title())} ready. Type /help for commands.")
 
     while True:
         try:
-            raw = input("daniel> ").strip()
+            raw = input(_c("1", f"{name}> ") if _COLORS else f"{name}> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
@@ -889,6 +968,31 @@ def run_chat(cfg: dict, initial_task: str | None) -> int:
         if raw == "/smoke":
             rc = _smoke_test(cfg, task_id)
             print(f"smoke exit code: {rc}")
+            continue
+        if raw.startswith("/kb "):
+            query = raw[4:].strip()
+            if not query:
+                print("Usage: /kb <search query>")
+                continue
+            results = _kb_search(query, cfg, limit=10)
+            if results:
+                print(f"\n{_c('36', 'KB results:')}\n{results}\n")
+            else:
+                print(_c("33", "No results (KB server may not be running)"))
+            continue
+        if raw == "/service recover":
+            recovered = []
+            for agent in AGENTS:
+                override = cfg["service_overrides"][agent]
+                if override.get("disabled_until") or override.get("manual_disabled"):
+                    override["manual_disabled"] = False
+                    override["disabled_until"] = ""
+                    recovered.append(agent)
+            if recovered:
+                _try_save_config(cfg)
+                print(f"Recovered: {', '.join(recovered)}")
+            else:
+                print("All agents already up.")
             continue
         if raw == "/service status":
             changed = False
@@ -1044,7 +1148,9 @@ def run_chat(cfg: dict, initial_task: str | None) -> int:
             agent, out, failures = _chat_once(role, user_text, cfg, history, task_id)
             print(_render_response_block(agent, role, out))
             if failures:
-                print(f"fallbacks: {' | '.join(failures)}\n")
+                for f in failures:
+                    print(_c("33", f"  [fallback] {f}"))
+                print()
             history.append({"role": "assistant", "text": out})
             history[:] = history[-20:]
         except Exception as exc:
@@ -1052,7 +1158,7 @@ def run_chat(cfg: dict, initial_task: str | None) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Daniel terminal assistant")
+    parser = argparse.ArgumentParser(description="Multi-agent terminal orchestrator")
     parser.add_argument("--setup", action="store_true", help="run setup wizard and exit")
     parser.add_argument("--task", default="", help="initial task id")
     args = parser.parse_args()
