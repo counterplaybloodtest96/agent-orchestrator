@@ -467,6 +467,7 @@ def _call_gemini_cli(prompt: str, cfg: dict) -> str:
         "gemini",
         "-p", prompt,
         "--model", cfg["models"]["gemini"],
+        "--yolo",
     ]
     try:
         proc = subprocess.run(
